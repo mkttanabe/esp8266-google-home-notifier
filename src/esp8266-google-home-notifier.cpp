@@ -57,10 +57,59 @@ boolean GoogleHomeNotifier::device(const char * name, const char * locale, int t
   return true;
 }
 
+#ifdef TANABE
+boolean GoogleHomeNotifier::ip(IPAddress ip, const char *locale)
+{
+  this->m_ipaddress = ip;
+  this->m_port = 8009;
+  sprintf(this->m_locale, "%s", locale);
+  return true;
+}
+
+boolean GoogleHomeNotifier::notify(const char * phrase) {
+  return this->cast(phrase, NULL, NULL);
+}
+
+boolean GoogleHomeNotifier::play(const char * mp3Url, void (*callbackFunc)(int)) {
+  return this->cast(NULL, mp3Url, callbackFunc);
+}
+
+boolean GoogleHomeNotifier::cast(const char * phrase, const char * mp3Url, void (*callbackFunc)(int))
+#else
 boolean GoogleHomeNotifier::notify(const char * phrase)
+#endif
 {
   char error[128];
   String speechUrl;
+
+#ifdef TANABE
+  if (observerTaskEvent != NULL) {
+	// pause the task
+    xEventGroupClearBits(observerTaskEvent, BIT0);
+    delay(200);
+  }
+  if (m_client) {
+    disconnect();
+  }
+
+  // register callback function to get the playback status
+  if (callbackFunc != NULL && mp3Url != NULL) {
+    playEndCallback = callbackFunc;
+  } else {
+    playEndCallback = NULL;
+  }
+
+  if (mp3Url == NULL) {
+    speechUrl = tts.getSpeechUrl(phrase, m_locale);
+    delay(1);
+    if (speechUrl.indexOf("https://") != 0) {
+      this->setLastError("Failed to get TTS url.");
+      return false;
+    }
+  } else {
+    speechUrl = mp3Url;
+  }
+#else
   speechUrl = tts.getSpeechUrl(phrase, m_locale);
   delay(1);
 
@@ -68,6 +117,7 @@ boolean GoogleHomeNotifier::notify(const char * phrase)
     this->setLastError("Failed to get TTS url.");
     return false;
   }
+#endif
 
   delay(1);
   if(!m_client) m_client = new WiFiClientSecure();
@@ -87,14 +137,24 @@ boolean GoogleHomeNotifier::notify(const char * phrase)
   }
    
   delay(1);
+#ifdef TANABE
+  if( this->_play(speechUrl.c_str()) != true) {
+#else
   if( this->play(speechUrl.c_str()) != true) {
+#endif
     sprintf(error, "Failed to play mp3 file. (%s)", this->getLastError());
     this->setLastError(error);
     disconnect();
     return false;
   }
 
+#ifdef TANABE
+  if (playEndCallback == NULL) {
+    disconnect();
+  }
+#else
   disconnect();
+#endif
   return true;
 }
 
@@ -108,8 +168,107 @@ const uint16_t GoogleHomeNotifier::getPort()
   return m_port;
 }
 
+#ifdef TANABE
+// task to monitor the playback status
+void observerTask(void* arg) {
+  GoogleHomeNotifier *self = (GoogleHomeNotifier*)arg;
+  extensions_api_cast_channel_CastMessage imsg;
+  pb_istream_t istream;
+  uint8_t pcktSize[4];
+  uint8_t buffer[1024];
+  uint32_t message_length;
+  unsigned long lastPing = 0;
+  int sts = 1;
+
+  while (true) { // A
+    PRLN("observerTask: waiting..");
+    xEventGroupWaitBits(self->observerTaskEvent,  BIT0, false, true, portMAX_DELAY);
+    PRLN("observerTask: triggered");
+
+    while(true) { // B
+      EventBits_t bits = xEventGroupGetBits(self->observerTaskEvent);
+      if((bits & BIT0) != BIT0) {
+          sts = -1;
+          PRLN("observerTask: started another playback");
+          break;
+      }
+      delay(200);
+      if (millis() - lastPing >= 5000) {
+        // send 'PING' per 5 seconds
+        lastPing = millis();
+        self->sendMessage(SOURCE_ID, DESTINATION_ID, CASTV2_NS_HEARTBEAT, CASTV2_DATA_PING);
+      }
+      // read message from Google Home
+      memset(&imsg, 0, sizeof(imsg));
+      int bytes = self->m_client->read(pcktSize, 4);
+      if (bytes <= 0) {
+        continue;
+      }
+      message_length = 0;
+      for(int i=0;i<4;i++) {
+        message_length |= pcktSize[i] << 8*(3 - i);
+      }
+      self->m_client->read(buffer, message_length);
+      istream = pb_istream_from_buffer(buffer, message_length);
+
+      imsg.payload_utf8.funcs.decode = &(GoogleHomeNotifier::decode_string);
+      imsg.payload_utf8.arg = (void*)"body";
+
+      if (pb_decode(&istream, extensions_api_cast_channel_CastMessage_fields, &imsg) != true){
+        self->setLastError("Incoming message decoding");
+        Serial.println("observerTask: pb_decode error");
+        break;
+      }
+      //String json = String((char*)imsg.payload_utf8.arg);
+      //PRLN(String("observerTask: ") + json);
+      char *p = (char*)imsg.payload_utf8.arg;
+
+      if (strstr(p, CASTV2_DATA_CLOSE)) {
+        PRLN("observerTask: CASTV2_DATA_CLOSE");
+        // another cast session has started
+        self->disconnect();
+        sts = 0; // stop playing
+        break;
+      } else if (strstr(p, "\"idleReason\":\"FINISHED\"")) {
+        PRLN("observerTask: FINISHED");
+        // playback end
+        self->disconnect();
+        sts = 1; // play next data
+        break;
+      } else if (strstr(p, "\"playerState\":\"PAUSED\"")) {
+        PRLN("observerTask: PAUSED");
+        // "OK, Google. stop"
+        self->disconnect();
+        sts = 0;
+        break;
+      } else if (strstr(p, "\"playerState\":\"PLAYING\"") && 
+                 !strstr(p, "\"requestId\":0")) {
+        PRLN("observerTask: SKIP");
+        // "OK, Google. next"
+        self->disconnect();
+        sts = 1;
+        break;
+      } else if (strstr(p, CASTV2_DATA_PING)) { // 'PING'
+        // send 'PONG'
+        self->sendMessage(DESTINATION_ID, SOURCE_ID, CASTV2_NS_HEARTBEAT, CASTV2_DATA_PONG);
+      }
+    } // while B
+
+    xEventGroupClearBits(self->observerTaskEvent, BIT0);
+    if (self->playEndCallback != NULL) {
+      PRLN("observerTask: start callback");
+      (self->playEndCallback)(sts);
+      PRLN("observerTask: done callback");
+    }
+  } // while A
+}
+#endif // TANABE
+
 boolean GoogleHomeNotifier::sendMessage(const char* sourceId, const char* destinationId, const char* ns, const char* data)
 {
+#ifdef TANABE
+  //PRLN(String("sendMessage: ") + ns);
+#endif
   extensions_api_cast_channel_CastMessage message = extensions_api_cast_channel_CastMessage_init_default;
 
   message.protocol_version = extensions_api_cast_channel_CastMessage_ProtocolVersion_CASTV2_1_0;
@@ -155,6 +314,19 @@ boolean GoogleHomeNotifier::sendMessage(const char* sourceId, const char* destin
   m_client->write(packetSize, 4);
   m_client->write(buf, bufferSize);
   m_client->flush();
+
+#ifdef TANABE
+  // create the task to monitor the playback status
+  if (playEndCallback != NULL && strcmp(ns, CASTV2_NS_MEDIA) == 0) {
+    if (observerTaskHandle == NULL) {
+        PRLN("sendMessage: TaskCreate");
+        observerTaskEvent = xEventGroupCreate();
+        xTaskCreatePinnedToCore(observerTask, "observerTask", 8192, this, 1, &observerTaskHandle, 1);
+        delay(200);
+    }
+    xEventGroupSetBits(observerTaskEvent, BIT0);
+  }
+#endif
 
   delay(1);
   delete buf;
@@ -244,7 +416,11 @@ boolean GoogleHomeNotifier::connect()
   return true;
 }
 
+#ifdef TANABE
+boolean GoogleHomeNotifier::_play(const char * mp3url)
+#else
 boolean GoogleHomeNotifier::play(const char * mp3url)
+#endif
 {
   // send 'CONNECT' again
   sprintf(data, CASTV2_DATA_CONNECT);
